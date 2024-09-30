@@ -1,0 +1,22 @@
+[project]
+name = "lerf_gaussian"
+description = "Custom LERF method using Gaussian Splatting"
+version = "0.1.0"
+
+dependencies=[
+    "open_clip_torch",
+    "timm",
+    "ftfy",
+    "regex",
+    "tqdm",
+    "clip @ git+https://github.com/openai/CLIP.git",
+    "nerfstudio>=0.3.1"
+] 
+
+[tool.setuptools.packages.find]
+include = ["lerf_gaussian*"]
+
+[project.entry-points.'nerfstudio.method_configs']
+lerf_gaussian = 'lerf_gaussian.lerf_gaussian_config:lerf_gaussian_method'
+lerf_gaussian_big = 'lerf_gaussian.lerf_gaussian_config:lerf_gaussian_method_big'
+lerf_gaussian_lite = 'lerf_gaussian.lerf_gaussian_config:lerf_gaussian_method_lite'

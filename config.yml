@@ -1,0 +1,12 @@
+_target: nerfstudio.engine.trainer.TrainerConfig
+pipeline:
+  _target: lerf.lerf_pipeline.LERFPipelineConfig
+  datamanager:
+    _target: lerf.data.lerf_datamanager.LERFDataManagerConfig
+    data: /datasets/3D/nerf_llff_data/meeting_room/
+    train_num_rays_per_batch: 2048
+    eval_num_rays_per_batch: 2048
+    train_num_images_to_sample_from: 100
+    eval_num_images_to_sample_from: 10
+    dataparser:
+      downscale_factor: 2
