@@ -25,6 +25,7 @@ from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
+from torch import Tensor, nn
 
 try:
     from gsplat.rendering import rasterization
@@ -44,6 +45,9 @@ from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.misc import torch_compile
 from nerfstudio.utils.rich_utils import CONSOLE
+from nerfstudio.field_components.mlp import MLP, MLPWithHashEncoding
+
+from lerf.lerf_renderers import CLIPRenderer, MeanRenderer
 
 from lerf_gaussian.encoders.openclip_encoder import OpenCLIPNetworkConfig, OpenCLIPNetwork
 from lerf_gaussian.data.utils.dino_extractor import ViTExtractor
@@ -216,6 +220,27 @@ class SplatfactoModelConfig(ModelConfig):
     """If True, apply color correction to the rendered images before computing the metrics."""
     """NEW implementation"""
     clip_loss_weight: float = 0.1
+    """weight of clip loss"""   
+    clip_n_dims: int = 512
+    """number of dimensions of clip embeddings"""
+    num_layers: int = 2
+    """number of layers in the MLP"""
+    num_levels: int = 16
+    """number of levels in the MLP"""
+    base_res: int = 16
+    """base resolution of the MLP"""
+    max_res: int = 2048
+    """max resolution of the MLP"""
+    hidden_dim: int = 64
+    """hidden dimension of the MLP"""
+    features_per_level: int = 2
+    """features per level of the MLP"""
+    geo_feat_dim: int = 15
+    """geometric feature dimension of the MLP"""
+    log2_hashmap_size: int = 19
+    """log2 of hashmap size of the MLP"""
+    implementation: Literal["tcnn", "torch"] = "tcnn"
+    """implementation of the MLP"""
 
 class SplatfactoModel(Model):
     """Nerfstudio's implementation of Gaussian Splatting
@@ -234,6 +259,11 @@ class SplatfactoModel(Model):
     ):
         self.seed_points = seed_points
         super().__init__(*args, **kwargs)
+
+        self.register_buffer("max_res", torch.tensor(self.config.max_res))
+        self.register_buffer("num_levels", torch.tensor(self.config.num_levels))
+        self.register_buffer("log2_hashmap_size", torch.tensor(self.config.log2_hashmap_size))
+
 
     def populate_modules(self):
         if self.seed_points is not None and not self.config.random_init:
@@ -272,24 +302,32 @@ class SplatfactoModel(Model):
 
         opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
         
-        # CLIP and DINO encoders
-        #self.clip_encoder = OpenCLIPNetworkConfig(
-        #        clip_model_type="ViT-B-16", clip_model_pretrained="laion2b_s34b_b88k", clip_n_dims=512
-        #    )
-        clip_network_config = OpenCLIPNetworkConfig(
-            clip_model_type="ViT-B-16", 
-            clip_model_pretrained="laion2b_s34b_b88k", 
-            clip_n_dims=512
-        )
 
-        self.clip_encoder = OpenCLIPNetwork(config=clip_network_config)
+        self.renderer_clip = CLIPRenderer()
+        self.renderer_mean = MeanRenderer()
 
-        # Define the clip_net similar to LERFField
+
+        #Base MLP with hash encoding from Nerfacto
+        self.mlp_base = MLPWithHashEncoding(
+                    num_levels=self.config.num_levels,
+                    min_res=self.config.base_res,
+                    max_res=self.config.max_res,
+                    log2_hashmap_size=self.config.log2_hashmap_size,
+                    features_per_level=self.config.features_per_level,
+                    num_layers=self.config.num_layers,
+                    layer_width=self.config.hidden_dim,
+                    out_dim=1 + self.config.geo_feat_dim,
+                    activation=nn.ReLU(),
+                    out_activation=None,
+                    implementation=self.config.implementation,
+                )
+        tot_out_dims = self.mlp_base.out_dim
+
         self.clip_net = tcnn.Network(
-            n_input_dims=9, # concatenate positions, features, and scales
-            n_output_dims=self.clip_encoder.embedding_dim,  # Should be 512
+            n_input_dims=tot_out_dims,
+            n_output_dims=self.config.clip_n_dims,
             network_config={
-                 "otype": "CutlassMLP",
+                "otype": "CutlassMLP",
                 "activation": "ReLU",
                 "output_activation": "None",
                 "n_neurons": 256,
@@ -298,8 +336,8 @@ class SplatfactoModel(Model):
         )
 
         self.dino_net = tcnn.Network(
-            n_input_dims= 9, # concatenate positions, features, and scales
-            n_output_dims=384,  # DINO embedding dimension
+            n_input_dims=tot_out_dims,
+            n_output_dims=384,
             network_config={
                 "otype": "CutlassMLP",
                 "activation": "ReLU",
@@ -308,8 +346,18 @@ class SplatfactoModel(Model):
                 "n_hidden_layers": 1,
             },
         )
+
+
+        # CLIP and DINO encoders
+        clip_network_config = OpenCLIPNetworkConfig(
+            clip_model_type="ViT-B-16", 
+            clip_model_pretrained="laion2b_s34b_b88k", 
+            clip_n_dims=512
+        )
+        self.clip_encoder = OpenCLIPNetwork(config=clip_network_config)
         self.dino_encoder = ViTExtractor("dino_vits8", 8)
         
+
         self.gauss_params = torch.nn.ParameterDict(
             {
                 "means": means,
@@ -908,43 +956,33 @@ class SplatfactoModel(Model):
         features = self.features_dc  # Shape: [N, 3]
         scales = torch.exp(self.scales)  # Shape: [N, 3]
 
-        """if positions.shape[0] < 5000:
-            print("Number of gaussians", positions.shape[0])
-            #Add new null points until we reach 5000
-            positions = torch.cat([positions, torch.zeros(5000 - positions.shape[0], 3).to(positions.device)], dim=0)
-            features = torch.cat([features, torch.zeros(5000 - features.shape[0], 3).to(features.device)], dim=0)
-            scales = torch.cat([scales, torch.zeros(5000 - scales.shape[0], 3).to(scales.device)], dim=0)
-        if positions.shape[0] > 5000:
-            print("Number of gaussians", positions.shape[0])
-            #Remove points until we reach 5000
-            positions = positions[:5000]
-            features = features[:5000]
-            scales = scales[:5000]
-        """
+
+        hash_encoding_outputs = self.mlp_base(positions)
 
         # Concatenate the inputs
-        clip_net_input = torch.cat([positions, features, scales], dim=-1)  # Shape: [N, input_dim]
-        print('Clip net input shape', clip_net_input.shape)
-        # Compute the embeddings
-        embeddings = self.clip_net(clip_net_input)
-        embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)  # Normalize embeddings
-        print('Embeddings shape', embeddings.shape)
+        #clip_net_input = torch.cat([positions, features, scales], dim=-1)  # Shape: [N, input_dim]
+        #print('Clip net input shape', clip_net_input.shape)
+        
+        # Compute CLIP embeddings
+        clip_pass = self.clip_net(hash_encoding_outputs)
+        clip_pass = clip_pass / clip_pass.norm(dim=-1, keepdim=True)  # Normalize embeddings
+        #clip_pass = self.get_output_from_hashgrid(camera, hash_encoding_outputs,scales)
+        print('CLIP shape', clip_pass.shape)
 
-        #Get parent (VanillaPipeline) to access datamanager
-   
-        datamanager = self.datamanager
-        clip_images = datamanager.get_embeddings(rgb)
-        clip_relevancy = self.get_clip_relevancy(embeddings)
-
-        dino_relevancy = self.dino_net(clip_net_input)   #self.get_dino_relevancy(colors_crop)
+        dino_pass = self.dino_net(hash_encoding_outputs)
+        print('DINO shape', dino_pass.shape)
+    
+        #clip_images = datamanager.get_embeddings(rgb)
+        #clip_relevancy = self.get_clip_relevancy(embeddings)
+        #dino_relevancy = self.dino_net(clip_net_input)   #self.get_dino_relevancy(colors_crop)
 
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore
-            "clip_relevancy": embeddings,
-            "dino_relevancy": dino_relevancy,
+            "clip_relevancy": clip_pass,
+            "dino_relevancy": dino_pass
         }  # type: ignore
 
     def get_clip_relevancy(self, embeddings):
@@ -1133,3 +1171,14 @@ class SplatfactoModel(Model):
         images_dict = {"img": combined_rgb}
 
         return metrics_dict, images_dict
+
+
+    def get_output_from_hashgrid(self, camera: Cameras, hashgrid_field, scale):
+        # designated scales, run outputs for each scale
+        hashgrid_field = hashgrid_field.view(-1, self.clip_net.n_input_dims - 1)
+        clip_pass = self.clip_net(torch.cat([hashgrid_field, scale.view(-1, 1)], dim=-1)).view(
+            camera.height, camera.width, -1
+        )
+        output = clip_pass / clip_pass.norm(dim=-1, keepdim=True)
+
+        return output

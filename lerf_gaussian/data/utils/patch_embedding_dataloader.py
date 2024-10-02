@@ -88,6 +88,7 @@ class PatchEmbeddingDataloader(FeatureDataloader):
         img_ind = img_ind.to(self.data.device)  # self.data is on cpu to save gpu memory, hence this line
         topleft = self.data[img_ind, x_ind, y_ind].to(self.device)
         topright = self.data[img_ind, x_ind + 1, y_ind].to(self.device)
+
         botleft = self.data[img_ind, x_ind, y_ind + 1].to(self.device)
         botright = self.data[img_ind, x_ind + 1, y_ind + 1].to(self.device)
 

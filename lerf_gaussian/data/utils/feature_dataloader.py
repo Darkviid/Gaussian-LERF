@@ -20,8 +20,10 @@ class FeatureDataloader(ABC):
         self.device = device
         self.cache_path = cache_path
         self.data = None # only expect data to be cached, nothing else
-        self.try_load(image_list) # don't save image_list, avoid duplicates
-
+        if image_list is not None:
+            self.try_load(image_list) # don't save image_list, avoid duplicates
+        else:
+            print("Warning: image_list is None")
     @abstractmethod
     def __call__(self, img_points):
         # img_points: (B, 3) # (img_ind, x, y)

@@ -79,12 +79,13 @@ class SplatfactoDataManager(FullImageDatamanager):
                 "tile_size_range": [0.05, 0.5],
                 "tile_size_res": 7,
                 "stride_scaler": 0.5,
-                "image_shape": list(images.shape[2:4]),
-                "model_name": self.image_encoder.name,
+                "image_shape": list(images.shape[2:4]), #21, 3, 378, 512
+                "model_name": self.image_encoder.name,  
             },
             cache_path=clip_cache_path,
             model=self.image_encoder,
         )
+
 
 
     def next_train(self, step: int) -> Tuple[Cameras, Dict]:
@@ -172,7 +173,7 @@ class SplatfactoDataManager(FullImageDatamanager):
         batch = self.train_pixel_sampler.sample(image_batch)
         ray_indices = batch["indices"]
 
-        clip_embeddings, clip_scale = self.clip_interpolator(ray_indices)
+        clip_embeddings, clip_scale = self.clip_interpolator_output(ray_indices)
         dino_embeddings = self.dino_dataloader(ray_indices)
 
         embeddings["clip"] = clip_embeddings
