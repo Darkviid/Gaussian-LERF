@@ -36,7 +36,7 @@ class DiGModelConfig(SplatfactoModelConfig):
     gaussian_dim:int = 64
     """Dimension the gaussians actually store as features"""
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="SO3xR3"))
-
+    sh_degree: int = 2
 class DiGModel(SplatfactoModel):
     config: DiGModelConfig
 
@@ -204,6 +204,7 @@ class DiGModel(SplatfactoModel):
             render_mode = "RGB"
 
         if self.config.sh_degree > 0:
+            print("Using SH degree: ", self.config.sh_degree)
             sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
         else:
             sh_degree_to_use = None

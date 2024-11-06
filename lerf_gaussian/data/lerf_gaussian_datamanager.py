@@ -31,12 +31,13 @@ class SplatfactoDataManagerConfig(FullImageDatamanagerConfig):
     _target: Type = field(default_factory=lambda: SplatfactoDataManager)
     # Include any additional configuration parameters if needed
     # For example, paths to cache directories, etc.
-    train_num_rays_per_batch: int = 5000
+    train_num_rays_per_batch: int = 3000
     """Number of rays per batch to use per training iteration."""
     patch_size: int = 1
     """Size of patch to sample from. If > 1, patch-based sampling will be used."""
     pixel_sampler: PixelSamplerConfig = field(default_factory=PixelSamplerConfig)
     """Specifies the pixel sampler used to sample pixels from images."""
+    
 
 class SplatfactoDataManager(FullImageDatamanager):
     config: SplatfactoDataManagerConfig
@@ -50,6 +51,7 @@ class SplatfactoDataManager(FullImageDatamanager):
         local_rank: int = 0,
         **kwargs,
     ):
+        config.pixel_sampler.keep_full_image = True
         super().__init__(config, device, test_mode, world_size, local_rank, **kwargs)
         self.image_encoder: BaseImageEncoder = kwargs["image_encoder"]
         #self.dino_encoder = kwargs["dino_encoder"]
@@ -71,6 +73,7 @@ class SplatfactoDataManager(FullImageDatamanager):
             cfg={"image_shape": list(images.shape[2:4])},
             cache_path=dino_cache_path,
         )
+
         torch.cuda.empty_cache()
         self.clip_interpolator = PyramidEmbeddingDataloader(
             image_list=images,
@@ -116,14 +119,42 @@ class SplatfactoDataManager(FullImageDatamanager):
         #  [0.1412, 0.2000, 0.0863]]]])}
 
         image_batch = {"image_idx": torch.tensor([image_idx], device=self.device), "image": data["image"].unsqueeze(0)}
+        #CLIP model outputs embeddings 320x180x512
+        tile_width = 320
+        tile_height = 180
+        N = tile_width * tile_height
+        # Get image dimensions
+        W, H = data["image"].shape[1], data["image"].shape[2]
+
+        # Create grid of pixel positions
+        pixel_x = torch.arange(0, H, H / tile_width, device=self.device).long()
+        pixel_y = torch.arange(0, W, W / tile_height, device=self.device).long()
+
+        # Create meshgrid and flatten
+        grid_x, grid_y = torch.meshgrid(pixel_x, pixel_y, indexing='ij')
+        grid_x = grid_x.flatten()
+        grid_y = grid_y.flatten()
+
+        # Ensure the number of samples matches N
+        assert grid_x.shape[0] == N and grid_y.shape[0] == N
+
+        # Create the tensor with image_idx, pixel_x, pixel_y
+        image_idxs = image_batch['image_idx'].expand(N)
+        tiles_tensor = torch.stack((image_idxs, grid_x, grid_y), dim=1)
+
+
+        #self.clip_interpolator.create(image_batch['image'])
 
         assert self.train_pixel_sampler is not None
-        #assert False, "This is a stub, and should be implemented by the user"
+        
         batch = self.train_pixel_sampler.sample(image_batch)
-        ray_indices = batch["indices"]
+        ray_indices = batch["indices"] #shape (Index, PixelX, PixelY)
 
-        clip_embeddings, clip_scale = self.clip_interpolator(ray_indices)
-        data["clip"] = clip_embeddings
+        #Try to use the clip encoder from the image to get the embeddings with shape (W,H, 512)
+        #image_float = data["image"].float()
+        #clip_ground_truth = self.image_encoder.encode_image(image_float.to(self.device))
+        clip_embeddings, clip_scale = self.clip_interpolator(tiles_tensor)#(ray_indices)
+        data["clip"] = clip_embeddings.unsqueeze(0)
         camera.metadata["clip_scales"] = clip_scale
 
         # For DINO embeddings

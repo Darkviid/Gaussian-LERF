@@ -52,6 +52,8 @@ from lerf.lerf_renderers import CLIPRenderer, MeanRenderer
 from lerf_gaussian.encoders.openclip_encoder import OpenCLIPNetworkConfig, OpenCLIPNetwork
 from lerf_gaussian.data.utils.dino_extractor import ViTExtractor
 
+from pytorch3d.structures import Pointclouds
+from pytorch3d.renderer import ( PointsRenderer, PointsRasterizationSettings, PointsRasterizer, AlphaCompositor, FoVPerspectiveCameras)
 import tinycudann as tcnn
 
 def quat_to_rotmat(quat):
@@ -950,12 +952,10 @@ class SplatfactoModel(Model):
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
-
         # Inside get_outputs or a suitable method
-        positions = self.means  # Shape: [N, 3]
+        positions = means_crop  # Shape: [N, 3]
         features = self.features_dc  # Shape: [N, 3]
         scales = torch.exp(self.scales)  # Shape: [N, 3]
-
 
         hash_encoding_outputs = self.mlp_base(positions)
 
@@ -967,26 +967,96 @@ class SplatfactoModel(Model):
         clip_pass = self.clip_net(hash_encoding_outputs)
         clip_pass = clip_pass / clip_pass.norm(dim=-1, keepdim=True)  # Normalize embeddings
         #clip_pass = self.get_output_from_hashgrid(camera, hash_encoding_outputs,scales)
-        print('CLIP shape', clip_pass.shape)
+        #convert from [5000, 512] to [5000, 1, 512]
+        clip_pass = clip_pass.unsqueeze(0)
+        print('Number of points: ', clip_pass.shape[1])
 
-        dino_pass = self.dino_net(hash_encoding_outputs)
-        print('DINO shape', dino_pass.shape)
+        #Convert clip_pass to float32
+        clip_pass = clip_pass.float()
+
+        """clip_feats, clip_alpha, _ = rasterization(
+            means=means_crop,
+            quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+            scales=torch.exp(scales_crop),
+            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+            colors=clip_pass, #ToDo Right now [5000, 512] and need to be 3 dims: [5000, 1, 512] probably
+            viewmats=viewmat,  # [1, 4, 4]
+            Ks=K,  # [1, 3, 3]
+            width=W,
+            height=H,
+            tile_size=BLOCK_WIDTH,
+            packed=False,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode=render_mode,
+            sh_degree=None,
+            sparse_grad=False,
+            absgrad=False,#True,
+            rasterize_mode=self.config.rasterize_mode,
+            # set some threshold to disregrad small gaussians for faster rendering.
+            # radius_clip=3.0,
+        )
+        """
+
+        #Using pytorch3d to rasterize the clip embeddings
+        #points = means_crop
+        #Remove first dimension (1)
+        features = clip_pass.squeeze(0)
+
+        point_cloud = Pointclouds(points=[means_crop], features=[features])
+        # Define camera parameters
+        #Get the rotation and translation from the camera using camera_to_worlds – Camera to world matrices. Tensor of per-image c2w matrices, in [R | t] format
+        R = optimized_camera_to_world[0, :3, :3].unsqueeze(0)
+        T = optimized_camera_to_world[0, :3, 3].unsqueeze(0)
+        
+        cameras = FoVPerspectiveCameras(device=self.device, R=R, T=T)
+       
+        # Define rasterization settings
+        raster_settings = PointsRasterizationSettings(
+            image_size=(180, 320), #(H, W),
+            radius= 0.015, # Adjust point size
+            points_per_pixel=1,
+        )
+
+        # Create a rasterizer
+        rasterizer = PointsRasterizer(cameras=cameras, raster_settings=raster_settings)
+
+        # Define compositor
+        compositor = AlphaCompositor()
+
+        # Create a renderer
+        renderer = PointsRenderer(rasterizer=rasterizer, compositor=compositor)
+        images = renderer(point_cloud, cameras=cameras)
+        clip_pass = images.squeeze(0)
+
+        #dino_pass = self.dino_net(hash_encoding_outputs)
+        #print('DINO shape', dino_pass.shape)
     
+        #Combine first two dimensions, from [h,w,512] to [h*w, 512]
+        clip_pass_flat = clip_pass.view(-1, clip_pass.shape[-1]) 
+
+        torch.cuda.empty_cache()
         #clip_images = datamanager.get_embeddings(rgb)
-        #clip_relevancy = self.get_clip_relevancy(embeddings)
+        clip_relevancy = self.get_clip_relevancy(clip_pass_flat).detach()
         #dino_relevancy = self.dino_net(clip_net_input)   #self.get_dino_relevancy(colors_crop)
 
+        clip_relevancy = clip_relevancy.view(clip_pass.shape[0], clip_pass.shape[1], clip_relevancy.shape[-1])
+
+        #Get only last layer of the clip_relevancy to get [H,W,1] shape
+        clip_relevancy = clip_relevancy[:, :, -1].unsqueeze(-1)
+        torch.cuda.empty_cache()
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore
-            "clip_relevancy": clip_pass,
-            "dino_relevancy": dino_pass
+            "clip": clip_pass,
+            "clip_relevancy": clip_relevancy,
+            #"dino": dino_pass
         }  # type: ignore
 
     def get_clip_relevancy(self, embeddings):
-        print('Features shape', embeddings.shape)
+        #print('Features shape', embeddings.shape)
          
         #gaussian_outputs = gaussian_outputs.view(gaussian_outputs.shape[0], -1)
         
@@ -1072,7 +1142,7 @@ class SplatfactoModel(Model):
             pred_img = pred_img * mask
 
         Ll1 = torch.abs(gt_img - pred_img).mean()
-        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
+        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...]).contiguous()
         if self.config.use_scale_regularization and self.step % 10 == 0:
             scale_exp = torch.exp(self.scales)
             scale_reg = (
@@ -1097,16 +1167,18 @@ class SplatfactoModel(Model):
             if self.config.use_bilateral_grid:
                 loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
 
-        
-        #clip_loss = torch.nn.functional.mse_loss(outputs["clip_relevancy"], batch["clip"], reduction="mean")
+        #Convert batch["clip"] from [HxW, 512] to [1, H, W, 512] H=720, W=1280
+        batch_clip = batch["clip"].view(1, outputs["clip"].shape[0], outputs["clip"].shape[1], 512).contiguous()
+
+        #clip_loss = torch.nn.functional.mse_loss(outputs["clip"], batch["clip"], reduction="mean")
         unreduced_clip = self.config.clip_loss_weight * torch.nn.functional.huber_loss(
-                outputs["clip_relevancy"].to(torch.float32), batch["clip"].to(torch.float32), delta=1.25, reduction="none"
-            )
+                outputs["clip"].to(torch.float32).contiguous(), batch_clip.to(torch.float32), delta=1.25, reduction="none"
+        )
         loss_dict["clip_loss"] = unreduced_clip.sum(dim=-1).nanmean()
         #loss_dict["clip_loss"] = loss_dict["clip_loss"].to(torch.float16)
 
-        dino_loss = torch.nn.functional.mse_loss(outputs["dino_relevancy"].to(torch.float32), batch["dino"].to(torch.float32), reduction="mean")
-        loss_dict["dino_loss"] = dino_loss
+        #dino_loss = torch.nn.functional.mse_loss(outputs["dino_relevancy"].to(torch.float32), batch["dino"].to(torch.float32), reduction="mean")
+        #loss_dict["dino_loss"] = dino_loss
 
         return loss_dict
 
