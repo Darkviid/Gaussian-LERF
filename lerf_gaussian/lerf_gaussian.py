@@ -123,7 +123,7 @@ def resize_image(image: torch.Tensor, d: int):
 
     image = image.to(torch.float32)
     weight = (1.0 / (d * d)) * torch.ones((1, 1, d, d), dtype=torch.float32, device=image.device)
-    return tf.conv2d(image.permute(2, 0, 1)[:, None, ...], weight, stride=d).squeeze(1).permute(1, 2, 0)
+    return tf.conv2d(image.permute(2, 0, 1)[:, None, ...], weight, stride=d).squeeze(1).permute(1, 2, 0).contiguous()
 
 
 @torch_compile()
@@ -957,7 +957,7 @@ class SplatfactoModel(Model):
         features = self.features_dc  # Shape: [N, 3]
         scales = torch.exp(self.scales)  # Shape: [N, 3]
 
-        hash_encoding_outputs = self.mlp_base(positions)
+        hash_encoding_outputs = self.mlp_base(positions).contiguous()
 
         # Concatenate the inputs
         #clip_net_input = torch.cat([positions, features, scales], dim=-1)  # Shape: [N, input_dim]
@@ -967,7 +967,7 @@ class SplatfactoModel(Model):
         clip_pass = self.clip_net(hash_encoding_outputs)
         clip_pass = clip_pass / clip_pass.norm(dim=-1, keepdim=True)  # Normalize embeddings
         #clip_pass = self.get_output_from_hashgrid(camera, hash_encoding_outputs,scales)
-        #convert from [5000, 512] to [5000, 1, 512]
+    
         clip_pass = clip_pass.unsqueeze(0)
         print('Number of points: ', clip_pass.shape[1])
 
@@ -1029,9 +1029,6 @@ class SplatfactoModel(Model):
         images = renderer(point_cloud, cameras=cameras)
         clip_pass = images.squeeze(0)
 
-        #dino_pass = self.dino_net(hash_encoding_outputs)
-        #print('DINO shape', dino_pass.shape)
-    
         #Combine first two dimensions, from [h,w,512] to [h*w, 512]
         clip_pass_flat = clip_pass.view(-1, clip_pass.shape[-1]) 
 
@@ -1043,8 +1040,16 @@ class SplatfactoModel(Model):
         clip_relevancy = clip_relevancy.view(clip_pass.shape[0], clip_pass.shape[1], clip_relevancy.shape[-1])
 
         #Get only last layer of the clip_relevancy to get [H,W,1] shape
-        clip_relevancy = clip_relevancy[:, :, -1].unsqueeze(-1)
+        clip_relevancy = clip_relevancy[:, :, -1].unsqueeze(-1).contiguous()
         torch.cuda.empty_cache()
+
+        dino_pass = self.dino_net(hash_encoding_outputs)
+        #Reduce the dimensionality from [5000,384] to [3000,384]
+        dino_pass = dino_pass[:3000, :] #Just for testing purposes
+
+        #print('DINO shape', dino_pass.shape)
+
+
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
@@ -1052,7 +1057,7 @@ class SplatfactoModel(Model):
             "background": background,  # type: ignore
             "clip": clip_pass,
             "clip_relevancy": clip_relevancy,
-            #"dino": dino_pass
+            "dino": dino_pass.float(), #Shape [3000, 384], therefore is not posible to visualize it, we should get dino embeddings in image space
         }  # type: ignore
 
     def get_clip_relevancy(self, embeddings):
@@ -1174,11 +1179,11 @@ class SplatfactoModel(Model):
         unreduced_clip = self.config.clip_loss_weight * torch.nn.functional.huber_loss(
                 outputs["clip"].to(torch.float32).contiguous(), batch_clip.to(torch.float32), delta=1.25, reduction="none"
         )
-        loss_dict["clip_loss"] = unreduced_clip.sum(dim=-1).nanmean()
+        loss_dict["clip_loss"] = unreduced_clip.sum(dim=-1).nanmean().contiguous()
         #loss_dict["clip_loss"] = loss_dict["clip_loss"].to(torch.float16)
 
-        #dino_loss = torch.nn.functional.mse_loss(outputs["dino_relevancy"].to(torch.float32), batch["dino"].to(torch.float32), reduction="mean")
-        #loss_dict["dino_loss"] = dino_loss
+        dino_loss = torch.nn.functional.mse_loss(outputs["dino"].to(torch.float32).contiguous(), batch["dino"].to(torch.float32).contiguous(), reduction="mean")
+        loss_dict["dino_loss"] = dino_loss.contiguous()
 
         return loss_dict
 
