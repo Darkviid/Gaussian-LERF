@@ -1,4 +1,4 @@
-# Gaussian LERF
+[![Typing SVG](https://readme-typing-svg.demolab.com?font=Fira+Code&pause=1000&color=32C3A9&width=435&lines=Guassian+LERF)](https://git.io/typing-svg)
 Code based on Splatfacto and LERF.
 
 ## File Structure
